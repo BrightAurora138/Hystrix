@@ -78,6 +78,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
     protected final HystrixCommandMetrics metrics;
 
+    protected final CommandMetricsHandler metricsHandler;
+
     protected final HystrixCommandKey commandKey;
     protected final HystrixCommandGroupKey commandGroup;
 
@@ -89,6 +91,7 @@ import java.util.concurrent.atomic.AtomicReference;
     protected final HystrixCommandExecutionHook executionHook;
 
     /* FALLBACK Semaphore */
+    private final SemaphoreHandler semaphoreHandler = new SemaphoreHandler();
     protected final TryableSemaphore fallbackSemaphoreOverride;
     /* each circuit has a semaphore to restrict concurrent fallback execution */
     protected static final ConcurrentHashMap<String, TryableSemaphore> fallbackSemaphorePerCircuit = new ConcurrentHashMap<String, TryableSemaphore>();
@@ -164,6 +167,7 @@ import java.util.concurrent.atomic.AtomicReference;
         this.properties = initCommandProperties(this.commandKey, propertiesStrategy, commandPropertiesDefaults);
         this.threadPoolKey = initThreadPoolKey(threadPoolKey, this.commandGroup, this.properties.executionIsolationThreadPoolKeyOverride().get());
         this.metrics = initMetrics(metrics, this.commandGroup, this.threadPoolKey, this.commandKey, this.properties);
+        this.metricsHandler = new CommandMetricsHandler(metrics);
         this.circuitBreaker = initCircuitBreaker(this.properties.circuitBreakerEnabled().get(), circuitBreaker, this.commandGroup, this.commandKey, this.properties, this.metrics);
         this.threadPool = initThreadPool(threadPool, this.threadPoolKey, threadPoolPropertiesDefaults);
 
@@ -202,7 +206,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
     private static HystrixCommandProperties initCommandProperties(HystrixCommandKey commandKey, HystrixPropertiesStrategy propertiesStrategy, HystrixCommandProperties.Setter commandPropertiesDefaults) {
         if (propertiesStrategy == null) {
-            return HystrixPropertiesFactory.getCommandProperties(commandKey, commandPropertiesDefaults);
+            return HystrixPropertiesFactory.createOrRetrieveCommandProperties(commandKey, commandPropertiesDefaults);
         } else {
             // used for unit testing
             return propertiesStrategy.getCommandProperties(commandKey, commandPropertiesDefaults);
@@ -657,7 +661,7 @@ import java.util.concurrent.atomic.AtomicReference;
                         return Observable.error(new IllegalStateException("execution attempted while in state : " + commandState.get().name()));
                     }
 
-                    metrics.markCommandStart(commandKey, threadPoolKey, ExecutionIsolationStrategy.THREAD);
+                    metricsHandler.markCommandStart(commandKey, threadPoolKey, ExecutionIsolationStrategy.THREAD);
 
                     if (isCommandTimedOut.get() == TimedOutStatus.TIMED_OUT) {
                         // the command timed out in the wrapping thread so we will return immediately
@@ -724,7 +728,7 @@ import java.util.concurrent.atomic.AtomicReference;
                         return Observable.error(new IllegalStateException("execution attempted while in state : " + commandState.get().name()));
                     }
 
-                    metrics.markCommandStart(commandKey, threadPoolKey, ExecutionIsolationStrategy.SEMAPHORE);
+                    metricsHandler.markCommandStart(commandKey, threadPoolKey, ExecutionIsolationStrategy.SEMAPHORE);
                     // semaphore isolated
                     // store the command that is being run
                     endCurrentThreadExecutingCommand = Hystrix.startCurrentThreadExecutingCommand(getCommandKey());
@@ -762,6 +766,10 @@ import java.util.concurrent.atomic.AtomicReference;
         // do this before executing fallback so it can be queried from within getFallback (see See https://github.com/Netflix/Hystrix/pull/144)
         executionResult = executionResult.addEvent((int) latency, eventType);
 
+        // Introduce explaining variables
+        boolean commandTimedOut = isCommandTimedOut.get() == TimedOutStatus.TIMED_OUT;
+        boolean fallbackDisabled = !properties.fallbackEnabled().get();
+
         if (isUnrecoverable(originalException)) {
             logger.error("Unrecoverable Error for HystrixCommand so will throw HystrixRuntimeException and not apply fallback. ", originalException);
 
@@ -773,7 +781,11 @@ import java.util.concurrent.atomic.AtomicReference;
                 logger.warn("Recovered from java.lang.Error by serving Hystrix fallback", originalException);
             }
 
-            if (properties.fallbackEnabled().get()) {
+            if (commandTimedOut && fallbackDisabled) {
+                // Original logic when command is timed out and fallback is disabled
+                logger.error("Command timed out and no fallback available.");
+                return Observable.error(new HystrixRuntimeException(FailureType.TIMEOUT, this.getClass(), "Command timed out and no fallback available.", originalException, null));
+            } else if (!fallbackDisabled) {
                 /* fallback behavior is permitted so attempt */
 
                 final Action1<Notification<? super R>> setRequestContext = new Action1<Notification<? super R>>() {
@@ -940,7 +952,7 @@ import java.util.concurrent.atomic.AtomicReference;
                 .setNotExecutedInThread();
         ExecutionResult cacheOnlyForMetrics = ExecutionResult.from(HystrixEventType.RESPONSE_FROM_CACHE)
                 .markUserThreadCompletion(latency);
-        metrics.markCommandDone(cacheOnlyForMetrics, commandKey, threadPoolKey, commandExecutionStarted);
+        metricsHandler.markCommandDone(cacheOnlyForMetrics, commandKey, threadPoolKey, commandExecutionStarted);
         eventNotifier.markEvent(HystrixEventType.RESPONSE_FROM_CACHE, commandKey);
     }
 
@@ -953,9 +965,9 @@ import java.util.concurrent.atomic.AtomicReference;
         long userThreadLatency = System.currentTimeMillis() - commandStartTimestamp;
         executionResult = executionResult.markUserThreadCompletion((int) userThreadLatency);
         if (executionResultAtTimeOfCancellation == null) {
-            metrics.markCommandDone(executionResult, commandKey, threadPoolKey, commandExecutionStarted);
+            metricsHandler.markCommandDone(executionResult, commandKey, threadPoolKey, commandExecutionStarted);
         } else {
-            metrics.markCommandDone(executionResultAtTimeOfCancellation, commandKey, threadPoolKey, commandExecutionStarted);
+            metricsHandler.markCommandDone(executionResultAtTimeOfCancellation, commandKey, threadPoolKey, commandExecutionStarted);
         }
 
         if (endCurrentThreadExecutingCommand != null) {
@@ -1234,15 +1246,7 @@ import java.util.concurrent.atomic.AtomicReference;
      */
     protected TryableSemaphore getFallbackSemaphore() {
         if (fallbackSemaphoreOverride == null) {
-            TryableSemaphore _s = fallbackSemaphorePerCircuit.get(commandKey.name());
-            if (_s == null) {
-                // we didn't find one cache so setup
-                fallbackSemaphorePerCircuit.putIfAbsent(commandKey.name(), new TryableSemaphoreActual(properties.fallbackIsolationSemaphoreMaxConcurrentRequests()));
-                // assign whatever got set (this or another thread)
-                return fallbackSemaphorePerCircuit.get(commandKey.name());
-            } else {
-                return _s;
-            }
+            return semaphoreHandler.getFallbackSemaphore(commandKey.name(), properties.fallbackIsolationSemaphoreMaxConcurrentRequests());
         } else {
             return fallbackSemaphoreOverride;
         }
@@ -1256,20 +1260,11 @@ import java.util.concurrent.atomic.AtomicReference;
     protected TryableSemaphore getExecutionSemaphore() {
         if (properties.executionIsolationStrategy().get() == ExecutionIsolationStrategy.SEMAPHORE) {
             if (executionSemaphoreOverride == null) {
-                TryableSemaphore _s = executionSemaphorePerCircuit.get(commandKey.name());
-                if (_s == null) {
-                    // we didn't find one cache so setup
-                    executionSemaphorePerCircuit.putIfAbsent(commandKey.name(), new TryableSemaphoreActual(properties.executionIsolationSemaphoreMaxConcurrentRequests()));
-                    // assign whatever got set (this or another thread)
-                    return executionSemaphorePerCircuit.get(commandKey.name());
-                } else {
-                    return _s;
-                }
+                return semaphoreHandler.getExecutionSemaphore(commandKey.name(), properties.executionIsolationSemaphoreMaxConcurrentRequests());
             } else {
                 return executionSemaphoreOverride;
             }
         } else {
-            // return NoOp implementation since we're not using SEMAPHORE isolation
             return TryableSemaphoreNoOp.DEFAULT;
         }
     }
@@ -1594,109 +1589,109 @@ import java.util.concurrent.atomic.AtomicReference;
 
     }
 
-    /* ******************************************************************************** */
-    /* ******************************************************************************** */
-    /* TryableSemaphore */
-    /* ******************************************************************************** */
-    /* ******************************************************************************** */
-
-    /**
-     * Semaphore that only supports tryAcquire and never blocks and that supports a dynamic permit count.
-     * <p>
-     * Using AtomicInteger increment/decrement instead of java.util.concurrent.Semaphore since we don't need blocking and need a custom implementation to get the dynamic permit count and since
-     * AtomicInteger achieves the same behavior and performance without the more complex implementation of the actual Semaphore class using AbstractQueueSynchronizer.
-     */
-    /* package */static class TryableSemaphoreActual implements TryableSemaphore {
-        protected final HystrixProperty<Integer> numberOfPermits;
-        private final AtomicInteger count = new AtomicInteger(0);
-
-        public TryableSemaphoreActual(HystrixProperty<Integer> numberOfPermits) {
-            this.numberOfPermits = numberOfPermits;
-        }
-
-        @Override
-        public boolean tryAcquire() {
-            int currentCount = count.incrementAndGet();
-            if (currentCount > numberOfPermits.get()) {
-                count.decrementAndGet();
-                return false;
-            } else {
-                return true;
-            }
-        }
-
-        @Override
-        public void release() {
-            count.decrementAndGet();
-        }
-
-        @Override
-        public int getNumberOfPermitsUsed() {
-            return count.get();
-        }
-
-    }
-
-    /* package */static class TryableSemaphoreNoOp implements TryableSemaphore {
-
-        public static final TryableSemaphore DEFAULT = new TryableSemaphoreNoOp();
-
-        @Override
-        public boolean tryAcquire() {
-            return true;
-        }
-
-        @Override
-        public void release() {
-
-        }
-
-        @Override
-        public int getNumberOfPermitsUsed() {
-            return 0;
-        }
-
-    }
-
-    /* package */static interface TryableSemaphore {
-
-        /**
-         * Use like this:
-         * <p>
-         * 
-         * <pre>
-         * if (s.tryAcquire()) {
-         * try {
-         * // do work that is protected by 's'
-         * } finally {
-         * s.release();
-         * }
-         * }
-         * </pre>
-         * 
-         * @return boolean
-         */
-        public abstract boolean tryAcquire();
-
-        /**
-         * ONLY call release if tryAcquire returned true.
-         * <p>
-         * 
-         * <pre>
-         * if (s.tryAcquire()) {
-         * try {
-         * // do work that is protected by 's'
-         * } finally {
-         * s.release();
-         * }
-         * }
-         * </pre>
-         */
-        public abstract void release();
-
-        public abstract int getNumberOfPermitsUsed();
-
-    }
+//    /* ******************************************************************************** */
+//    /* ******************************************************************************** */
+//    /* TryableSemaphore */
+//    /* ******************************************************************************** */
+//    /* ******************************************************************************** */
+//
+//    /**
+//     * Semaphore that only supports tryAcquire and never blocks and that supports a dynamic permit count.
+//     * <p>
+//     * Using AtomicInteger increment/decrement instead of java.util.concurrent.Semaphore since we don't need blocking and need a custom implementation to get the dynamic permit count and since
+//     * AtomicInteger achieves the same behavior and performance without the more complex implementation of the actual Semaphore class using AbstractQueueSynchronizer.
+//     */
+//    /* package */static class TryableSemaphoreActual implements TryableSemaphore {
+//        protected final HystrixProperty<Integer> numberOfPermits;
+//        private final AtomicInteger count = new AtomicInteger(0);
+//
+//        public TryableSemaphoreActual(HystrixProperty<Integer> numberOfPermits) {
+//            this.numberOfPermits = numberOfPermits;
+//        }
+//
+//        @Override
+//        public boolean tryAcquire() {
+//            int currentCount = count.incrementAndGet();
+//            if (currentCount > numberOfPermits.get()) {
+//                count.decrementAndGet();
+//                return false;
+//            } else {
+//                return true;
+//            }
+//        }
+//
+//        @Override
+//        public void release() {
+//            count.decrementAndGet();
+//        }
+//
+//        @Override
+//        public int getNumberOfPermitsUsed() {
+//            return count.get();
+//        }
+//
+//    }
+//
+//    /* package */static class TryableSemaphoreNoOp implements TryableSemaphore {
+//
+//        public static final TryableSemaphore DEFAULT = new TryableSemaphoreNoOp();
+//
+//        @Override
+//        public boolean tryAcquire() {
+//            return true;
+//        }
+//
+//        @Override
+//        public void release() {
+//
+//        }
+//
+//        @Override
+//        public int getNumberOfPermitsUsed() {
+//            return 0;
+//        }
+//
+//    }
+//
+//    /* package */static interface TryableSemaphore {
+//
+//        /**
+//         * Use like this:
+//         * <p>
+//         *
+//         * <pre>
+//         * if (s.tryAcquire()) {
+//         * try {
+//         * // do work that is protected by 's'
+//         * } finally {
+//         * s.release();
+//         * }
+//         * }
+//         * </pre>
+//         *
+//         * @return boolean
+//         */
+//        public abstract boolean tryAcquire();
+//
+//        /**
+//         * ONLY call release if tryAcquire returned true.
+//         * <p>
+//         *
+//         * <pre>
+//         * if (s.tryAcquire()) {
+//         * try {
+//         * // do work that is protected by 's'
+//         * } finally {
+//         * s.release();
+//         * }
+//         * }
+//         * </pre>
+//         */
+//        public abstract void release();
+//
+//        public abstract int getNumberOfPermitsUsed();
+//
+//    }
 
     /* ******************************************************************************** */
     /* ******************************************************************************** */

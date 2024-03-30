@@ -169,7 +169,7 @@ public interface HystrixThreadPool {
         private final int queueSize;
 
         public HystrixThreadPoolDefault(HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolProperties.Setter propertiesDefaults) {
-            this.properties = HystrixPropertiesFactory.getThreadPoolProperties(threadPoolKey, propertiesDefaults);
+            this.properties = HystrixPropertiesFactory.createOrRetrieveThreadPoolProperties(threadPoolKey, propertiesDefaults);
             HystrixConcurrencyStrategy concurrencyStrategy = HystrixPlugins.getInstance().getConcurrencyStrategy();
             this.queueSize = properties.maxQueueSize().get();
 

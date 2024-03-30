@@ -174,6 +174,9 @@ public class HystrixRequestLog {
         try {
             LinkedHashMap<String, Integer> aggregatedCommandsExecuted = new LinkedHashMap<String, Integer>();
             Map<String, Integer> aggregatedCommandExecutionTime = new HashMap<String, Integer>();
+            Map<HystrixEventType, EventFormatStrategy> strategies = new HashMap<>();
+            strategies.put(HystrixEventType.EMIT, new EmitEventFormatStrategy());
+            strategies.put(HystrixEventType.FALLBACK_EMIT, new FallbackEmitEventFormatStrategy());
 
             StringBuilder builder = new StringBuilder();
             int estimatedLength = 0;
@@ -187,26 +190,9 @@ public class HystrixRequestLog {
                     //replicate functionality of Arrays.toString(events.toArray()) to append directly to existing StringBuilder
                     builder.append("[");
                     for (HystrixEventType event : events) {
-                        switch (event) {
-                            case EMIT:
-                                int numEmissions = command.getNumberEmissions();
-                                if (numEmissions > 1) {
-                                    builder.append(event).append("x").append(numEmissions).append(", ");
-                                } else {
-                                    builder.append(event).append(", ");
-                                }
-                                break;
-                            case FALLBACK_EMIT:
-                                int numFallbackEmissions = command.getNumberFallbackEmissions();
-                                if (numFallbackEmissions > 1) {
-                                    builder.append(event).append("x").append(numFallbackEmissions).append(", ");
-                                } else {
-                                    builder.append(event).append(", ");
-                                }
-                                break;
-                            default:
-                                builder.append(event).append(", ");
-                        }
+                        EventFormatStrategy strategy = strategies.getOrDefault(event, new DefaultEventFormatStrategy());
+                        String formattedEvent = strategy.formatEvent(event, command.getNumberEmissions());
+                        builder.append(formattedEvent).append(", ");
                     }
                     builder.setCharAt(builder.length() - 2, ']');
                     builder.setLength(builder.length() - 1);

@@ -125,7 +125,7 @@ public abstract class HystrixCollapser<BatchReturnType, ResponseType, RequestArg
             collapserKey = HystrixCollapserKey.Factory.asKey(defaultKeyName);
         }
 
-        HystrixCollapserProperties properties = HystrixPropertiesFactory.getCollapserProperties(collapserKey, propertiesBuilder);
+        HystrixCollapserProperties properties = HystrixPropertiesFactory.createOrRetrieveCollapserProperties(collapserKey, propertiesBuilder);
         this.collapserFactory = new RequestCollapserFactory<BatchReturnType, ResponseType, RequestArgumentType>(collapserKey, scope, timer, properties);
         this.requestCache = HystrixRequestCache.getInstance(collapserKey, HystrixPlugins.getInstance().getConcurrencyStrategy());
 

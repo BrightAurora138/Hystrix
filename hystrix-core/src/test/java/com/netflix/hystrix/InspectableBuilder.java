@@ -39,8 +39,8 @@ public interface InspectableBuilder {
         HystrixCommandProperties.Setter commandPropertiesDefaults = HystrixCommandPropertiesTest.getUnitTestPropertiesSetter();
         HystrixThreadPoolProperties.Setter threadPoolPropertiesDefaults = HystrixThreadPoolPropertiesTest.getUnitTestPropertiesBuilder();
         HystrixCommandMetrics metrics;
-        AbstractCommand.TryableSemaphore fallbackSemaphore = null;
-        AbstractCommand.TryableSemaphore executionSemaphore = null;
+        TryableSemaphore fallbackSemaphore = null;
+        TryableSemaphore executionSemaphore = null;
         TestableExecutionHook executionHook = new TestableExecutionHook();
 
         TestCommandBuilder(HystrixCommandProperties.ExecutionIsolationStrategy isolationStrategy) {
@@ -90,12 +90,12 @@ public interface InspectableBuilder {
             return this;
         }
 
-        TestCommandBuilder setFallbackSemaphore(AbstractCommand.TryableSemaphore fallbackSemaphore) {
+        TestCommandBuilder setFallbackSemaphore(TryableSemaphore fallbackSemaphore) {
             this.fallbackSemaphore = fallbackSemaphore;
             return this;
         }
 
-        TestCommandBuilder setExecutionSemaphore(AbstractCommand.TryableSemaphore executionSemaphore) {
+        TestCommandBuilder setExecutionSemaphore(TryableSemaphore executionSemaphore) {
             this.executionSemaphore = executionSemaphore;
             return this;
         }
